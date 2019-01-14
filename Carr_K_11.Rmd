@@ -1,0 +1,458 @@
+# Theo Carr
+# 11 March 2018
+# DS 4100
+# Assignment 11
+
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Packages
+```{r}
+library(XML)
+library(ggplot2)
+library(magrittr)
+library(yaml)
+library(lubridate)
+library(RCurl)
+library(readxl)
+library(BSDA)
+library(forecast)
+```
+
+Importing data from excel file
+```{r}
+uffiData <- read_excel("uffidata.xlsx")
+```
+
+1. Are there outliers in the data set? If so, what is the appropriate action and how are they discovered?
+We'll define outliers as any cases which are farther than 3 standard deviations from the mean. We can calculate how many standard deviations from the mean each case is, then investigate all cases that are more than 3 standard deviations from the mean. 
+```{r}
+
+# First, creating a function to help calculate z-scores
+get_zScores <- function(n) {
+    # Function to calculate the Z-Score for each data point in a vector
+    # Args: Numeric vector
+    # Returns: Numeric vector representing the number of standard deviations from the mean for corresponding
+    # elements in 'n'
+    stdDev <- sd(n) # calculate the standard deviation of the data set
+    mean <- mean(n) # calculate the mean
+    zScore <- (n-mean)/stdDev # find how many standard deviations away each data point is
+    return(zScore) # return vector of z-scores
+}
+
+# calculating the z-scores for each of our non-categorical variables
+salePrice_zScore <- get_zScores(uffiData$`Sale Price`)
+bsmntArea_zScore <- get_zScores(uffiData$`Bsmnt Fin_SF`)
+lotArea_zScore <- get_zScores(uffiData$`Lot Area`)
+livArea_zScore <- get_zScores(uffiData$`Living Area_SF`)
+
+```
+
+Now, we'll find outliers. We choose to define "outlier" as any property with a sale price greater than three standard deviations from the mean. In practice, this means we will remove the three most expensive homes from our data set when performing statistical analyses. There may be meaningful information in the data we choose to exclude, but we will choose to focus on homes whose price falls into the specified ranged of +/- 3 standard deviations from the mean.
+```{r}
+# Any home with a sale price farther than "threshold" standard deviations from the mean will
+# be considered an outlier
+threshold <- 3
+outliers_salePrice <- which(abs(salePrice_zScore) > threshold); outliers_salePrice
+outliers_bsmntSF <- which(abs(bsmntArea_zScore) > threshold); outliers_bsmntSF
+outliers_lotArea <- which(abs(lotArea_zScore) > threshold); outliers_lotArea
+outliers_livArea <- which(abs(livArea_zScore) > threshold); outliers_livArea
+
+# Combine list of outliers
+outliers <- union(outliers_salePrice, union(outliers_bsmntSF, union(outliers_lotArea, outliers_livArea)))
+outliers # viewing output
+
+# New data frame to represent data with outliers removed
+uffi_noOutlier <- uffiData[-outliers,]
+colnames(uffi_noOutlier) <- c("Observation", "YearSold", "SalePrice", "UFFI_in", "BrickExt", "Age45",
+                              "BasementArea", "LotArea", "EnclosedSpaces", "LivingArea", "CentralAir",
+                              "Pool")
+
+
+
+```
+
+
+2. Using visual analysis of the sales price with a histogram, is the data normally distributed and thus amenable to parametric statistical analysis?
+
+We'll also calculate the log transform of the sale price, to see if this helps to normalize the data.
+```{r}
+# Calculating the logs
+logSalePrice <- log(uffi_noOutlier$SalePrice)
+# Adding the log transforms to our data frame
+uffi_noOutlier <- cbind(uffi_noOutlier, logSalePrice)
+
+# Visualizing with a histogram
+# First, unaltered Sale Price
+hist(uffi_noOutlier$SalePrice,
+     xlab = "Sale Price ($)",
+     ylab = "Frequency",
+     main = "Sale Price Histogram")
+
+# Next, log(Sale Price)
+hist(uffi_noOutlier$logSalePrice,
+     xlab = "log(Sale Price) (SF)",
+     ylab = "Frequency",
+     main = "Sale Price Histogram (Log transform)")
+
+
+```
+
+Analysis: Sales Price appears to roughly follow a normal distribution. Doing a log transform reduces the "bump" on the right side of the bell curve, but otherwise doesn't seem to signficantly normalize the data. Therefore, for our analysis, we'll assume that the Sale Price data is normally distributed.
+
+
+
+
+3. Using a z-test, is the presence or absence of UFFI alone enough to predict the value of a residential property?
+```{r}
+# Let's separate the samples with and without uffi
+uffi_yes <- uffi_noOutlier[which(uffi_noOutlier$UFFI_in == 1),] # cases with UFFI
+uffi_no <- uffi_noOutlier[-which(uffi_noOutlier$UFFI_in == 1),] # cases without UFFI
+
+# Performing a t-test
+uffi_t.test <- t.test(x = uffi_yes$SalePrice, y = uffi_no$SalePrice); uffi_t.test
+
+# Performing a z-test
+uffi_z.test <- z.test(x = uffi_yes$SalePrice,
+                      y = uffi_no$SalePrice,
+                      sigma.x = sd(uffi_yes$SalePrice),
+                      sigma.y = sd(uffi_no$SalePrice)); uffi_z.test
+```
+
+Based on a z-test, the presence of UFFI alone could potentially be used to predict the sales price of the home. The z-test compares the mean sales price of houses with and without UFFI, and attempts to determine if there is a statistically significant difference between them. Because the sample size is relatively small (~75 homes without UFFI and ~25 homes with UFFI), I think a t-test may be more appropriate in this case. Both tests returned p-values less than 0.05, but not by much.
+
+
+
+4. Is UFFI a significant predictor variable of selling price when taken with the full set of variables available?
+
+First, we'll investigate the relationship between the independent variables and the Sale Price of homes. We'll check to see if there is a positive or negative relationship, and whether the relationship is linear. 
+```{r}
+salePrice <- uffi_noOutlier$SalePrice
+yearSold <- uffi_noOutlier$YearSold
+uffiIn <- uffi_noOutlier$UFFI_in
+brickExt <- uffi_noOutlier$BrickExt
+age45 <- uffi_noOutlier$Age45
+basementSF <- uffi_noOutlier$BasementArea
+lotArea <- uffi_noOutlier$LotArea
+encSpace <- uffi_noOutlier$EnclosedSpaces
+livingSF <- uffi_noOutlier$LivingArea
+centralAir <- uffi_noOutlier$CentralAir
+pool <- uffi_noOutlier$Pool
+
+ggplot(uffi_noOutlier, aes(yearSold, salePrice)) + geom_point()
+ggplot(uffi_noOutlier, aes(uffiIn, salePrice)) + geom_point()
+ggplot(uffi_noOutlier, aes(brickExt, salePrice)) + geom_point()
+ggplot(uffi_noOutlier, aes(age45, salePrice)) + geom_point()
+ggplot(uffi_noOutlier, aes(basementSF, salePrice)) + geom_point()
+ggplot(uffi_noOutlier, aes(lotArea, salePrice)) + geom_point()
+ggplot(uffi_noOutlier, aes(encSpace, salePrice)) + geom_point()
+ggplot(uffi_noOutlier, aes(livingSF, salePrice)) + geom_point()
+ggplot(uffi_noOutlier, aes(centralAir, salePrice)) + geom_point()
+ggplot(uffi_noOutlier, aes(pool, salePrice)) + geom_point()
+
+```
+The best candidates for our linear regression model appear to be living area and year sold. Enclosed spaces also seems to display a linear trend. All three of these independent variables display a positive relationship with the Sale Price. UFFI appears to display a slight negative correlation, but we cannot say whether this effect will be significant when taken with the other variables.
+
+
+
+Now that we've established normality, excluded outliers, and identified several dependent variables that seem to be correlated with the sales price, we will create a multiple regression model. 
+```{r}
+# First, creating linear regression model
+model <- lm(SalePrice ~. -SalePrice -Observation -logSalePrice, data = uffi_noOutlier)
+# We include all variables from our data frame except for SalePrice, Observation, and logSalePrice
+summary(model)
+```
+The initial results match our expectations from the scatterplots: year sold and square footage are the best predictors of sale price, with enclosed spaces also statistically signficant. All other variables have p-values greater than 0.05. UFFI has a p-value of about 0.06, indicating it is close to being significant. We recall that taken on it's own, UFFI was statistically significant. Therefore, we conclude that in the context of other independent variables such as year sold and square footage, UFFI is not a significant predictor of the sale price of a home. However, all variables being equal, we would expect a house with UFFI to sell for slightly less than a a house without it. 
+
+
+
+5. What is the ideal multiple regression model for predicting home prices in this data set? Provide a detailed analysis of the model, including Adjusted R-Squared, MAD, and p-values of principal components.
+
+After first including all variables, we will use backward elimination to remove independent variables from our model which have p-values greater than 0.05.
+
+First, we remove Age45 variable, which has the highest p-value
+```{r}
+model_step <- lm(SalePrice ~. 
+                 -SalePrice 
+                 -Observation 
+                 -logSalePrice 
+                 -Age45, 
+                 data = uffi_noOutlier)
+summary(model_step)
+
+```
+
+We remove BrickExt predictor variable
+```{r}
+model_step <- lm(SalePrice ~. 
+                 -SalePrice 
+                 -Observation 
+                 -logSalePrice 
+                 -Age45 
+                 -BrickExt,
+                 data = uffi_noOutlier)
+summary(model_step)
+```
+
+We remove CentralAir predictor variable
+```{r}
+model_step <- lm(SalePrice ~. 
+                 -SalePrice 
+                 -Observation 
+                 -logSalePrice 
+                 -Age45 
+                 -BrickExt
+                 -CentralAir,
+                 data = uffi_noOutlier)
+summary(model_step)
+```
+
+We remove LotArea predictor variable
+```{r}
+model_step <- lm(SalePrice ~. 
+                 -SalePrice 
+                 -Observation 
+                 -logSalePrice 
+                 -Age45 
+                 -BrickExt
+                 -CentralAir
+                 -LotArea,
+                 data = uffi_noOutlier)
+summary(model_step)
+
+```
+
+We remove Pool predictor variable
+```{r}
+model_step <- lm(SalePrice ~. 
+                 -SalePrice 
+                 -Observation 
+                 -logSalePrice 
+                 -Age45 
+                 -BrickExt
+                 -CentralAir
+                 -LotArea
+                 -Pool,
+                 data = uffi_noOutlier)
+summary(model_step)
+```
+
+We remove UFFI predictor variable
+```{r}
+model_step <- lm(SalePrice ~. 
+                 -SalePrice 
+                 -Observation 
+                 -logSalePrice 
+                 -Age45 
+                 -BrickExt
+                 -CentralAir
+                 -LotArea
+                 -Pool
+                 -UFFI_in,
+                 data = uffi_noOutlier)
+summary(model_step)
+```
+
+All of the remaining variables have p-values < 0.05. Therefore, our ideal model is:
+```{r}
+# Creating ideal model
+model_ideal <- lm(SalePrice ~ YearSold + BasementArea + EnclosedSpaces + LivingArea, data = uffi_noOutlier)
+summary(model_ideal) # viewing model details
+plot(model_ideal) # plotting
+
+# Next, we'll calculate the MAD ("Mean absolute deviation")
+mean(abs(residuals(model_ideal))) # find the mean of the absolute value of residuals in the model 
+```
+
+The adjusted R-squared for the ideal model is 0.7381, indicating that about 74 percent of the variability in the dependent variable can be attributed to the independent variable. 
+
+The MAD for the model is about $11,000, indicating that on average, a given predicted value from our model differs from the corresponding actual value by this amount. 
+
+The Residuals vs. Fitted plot doesn't seem to display any distinct pattern; however, we note that the model did miss several cases by a large amount. We also note that the 7 highest fitted values all had positive residuals. The sample size is relatively small and therefore it is difficult to draw meaningful conclusions from this observation, but this trend may reveal a characteristic of housing markets, where homes on the upper end of the price spectrum require a different model than lower-priced homes (i.e. these houses belong to a different "cluster").
+
+The Normal Q-Q plot shows that actual and predicted values appear to fall into a similar distribution, with the plotted values generally following the 45º line. However, for the bottom and top quantiles, we note that the plotted values tail off, indicating that the actual data may have "fatter tails" than our model predicts.
+
+The p-values for YearSold and LivingArea are both essentially 0, indicating that they are both likely predictors of SalePrice. EnclosedSpaces and BasementArea have higher p-values, still less than 0.01, indicating we are less confident about their significance, but still consider them to be statistically meaningful predictors of SalePrice.
+
+
+6. On average, how do we expect UFFI will change the value of a property?
+```{r}
+# Adding uffiIn as an independent variable to our ideal multiple regression model
+model_uffi <- lm(SalePrice ~ YearSold + BasementArea + LivingArea + EnclosedSpaces + UFFI_in, 
+                 data = uffi_noOutlier)
+summary(model_uffi)
+```
+The p-value for UFFI is greater than our threshold of 0.05, indicating that we don't believe UFFI is a stastically signficant predictor. Keeping this in mind, we add UFFI to our multiple regression model to estimate the effect it might have on the sale price. According to our model, we expect the presence of UFFI to decrease the value of a home by almost $7,000 (with a standard error of about $3,500).
+
+
+
+7. If the home in question is older than 45 years old, doesn’t have a finished basement, has a lot area of 5000 square feet, has a brick exterior, 2 enclosed parking spaces, 1700 square feet of living space, central air, and no pool, what is its predicted value and what are the 95% confidence intervals of this home with UFFI and without UFFI?
+
+The year sold of the house is not specified in this case. The price of a house depends heavily on the time when it is sold - for example, a house sold in 2006 shortly before the housing market crash of 2008 would have a much different valuation two years later. For this reason, I will arbitrarily choose the year 2016 for the house in question (corresponding to the most recent cases from our data set). I believe this gives us a more meaningful answer than by removing YearSold from our model completely. I would not pick a year more than much farther in advance than 2018 (two years ahead of our most recent data), because of the uncertainty regarding future market cycles. Applying similar logic, I would not attempt to predict the price of a home in 2008.
+
+Based on earlier analysis, we have identified several meaningful predictors for the salePrice of a home: year sold, living area, basement area, and enclosed parking spaces. Therefore, when making predictions, we will ignore other variables.
+```{r}
+# First creating our ideal regression model (derived above)
+model_ideal <- lm(SalePrice ~ YearSold + BasementArea + EnclosedSpaces + LivingArea, data = uffi_noOutlier)
+
+# wrapping the parameters inside of a data frame
+house_data <- data.frame(YearSold = 2012, LivingArea = 1700, EnclosedSpaces = 2, BasementArea = 0)
+
+predict(model_ideal, house_data, interval = "predict") # applying the model 
+```
+
+Now, we will introduce UFFI, even though we have decided to exclude it from our ideal model.
+```{r}
+# Including UFFI in our model
+model_uffi <- lm(SalePrice ~ YearSold + BasementArea + LivingArea + EnclosedSpaces + UFFI_in, 
+                 data = uffi_noOutlier)
+
+# wrapping the parameters inside of a data frame (no UFFI)
+house_data1 <- data.frame(YearSold = 2016, LivingArea = 1700, EnclosedSpaces = 2,
+                          BasementArea = 0, UFFI_in = 0)
+noUFFI_pred <- predict(model_uffi, house_data1, interval = "predict") # applying the model 
+noUFFI_pred # viewing results
+
+# wrapping the parameters inside of a data frame (yes UFFI)
+house_data2 <- data.frame(YearSold = 2016, LivingArea = 1700, EnclosedSpaces = 2,
+                          BasementArea = 0, UFFI_in = 1)
+yesUFFI_pred <- predict(model_uffi, house_data2, interval = "predict") # applying the model 
+yesUFFI_pred # viewing results
+```
+
+8. If $215,000 was paid for this home, by how much, if any, did the client overpay, and how much compensation is justified due to overpayment?
+    Determining the amount of overpayment depends largely on how we define overpayment, and is complicated by when a house is sold. For example, we must take into account the real value of money: $1000 in 1980 was worth more than $1000 today. If two houses sold for the same price, but 20 years apart, the "real" sales price (adjusted for inflation) would be different.
+    We must also take into consideration market cycles. As discussed previously, the Sale Price of a house would be dramatically different if sold in 2006, before the market collapsed, versus 2009, in the midst of the downturn. This makes determining the actual value of a home tricky, and means it is difficult to separate the Sale Price of a home from when it was (or will be) sold.
+    Additionally, we must take into consideration other external market factors - if a bidding competition drives up the Sale Price of a house, does this mean that the winning bidder should be compensated for overpayment? In a capitalist market, probably not, because someone else was willing to buy the house at a slightly lower price.
+    For these reasons, it seems highly unlikely that compensation is justified due to overpayment. Our model will inform us the expected range of the Sale Price for similar houses at a given time period, and give us an indicator of how much more than expected the client paid.
+    A stronger argument would be to examine the effect of deceit - we can prove that ignoring all other variables, houses with UFFI sell for about $7,000 less than those without UFFI.
+
+
+
+9. Build predictive models for forecasting prices for the next year based on average historical sales prices per year. You must build a weighted moving average model with weights of 5, 3, 2 where 5 is the weight for the most recent year, an exponential smoothing model with an alpha of 0.8, and a linear regression time series model. Evaluate the models based on their MSEs. Calculate the forecast for the next year and provide a 95% confidence interval for the linear regression time series model forecast using standard error.
+
+First, let's derive the average sale price data
+```{r}
+year = 2009:2016 # Years corresponding to our data
+AvgPrice = vector(mode = 'numeric', length = length(year))
+
+for (year in 2009:2016) { # for each year
+    # compute the average price of homes
+    AvgPrice[year-2008] <- mean(uffi_noOutlier$SalePrice[which(uffi_noOutlier$YearSold == year)])
+}
+names(AvgPrice) <- c(2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016) # naming elements of the vector
+AvgPrice # outputting the average price for each year
+
+plot(AvgPrice) # plotting
+```
+
+Next, weighted moving average model of the form: 
+```{r}
+# The model has the below equation:
+# Yt = 5*Y(t-1) + 3*Y(t-2) + 2*Y(t-3)
+a = 5 # weight for most recent year
+b = 3 # weight for second most recent year
+c = 2 # weight for third most recent year
+
+wma <- function(year) {
+    # Function forecasts the average sales in a given year based on three most recent years
+    # Args: year to be forecasted
+    # Returns: estimated average sale price
+    # Note this function is only valid for input arguments 2012 to 2017
+    i = year-2008 # normalizing the indexing to compare to AvgPrice
+    pred <- (a * AvgPrice[i-1] + b * AvgPrice[i-2] + c * AvgPrice[i-3]) / (a + b + c) # calculating forecast
+    names(pred) <- year # naming according to input
+    return(pred) # returning the prediction
+}
+
+pred2009 <- AvgPrice[1] # We'll artificially set the first "prediction" to match the actual
+pred2010 <- AvgPrice[1] # Model's prediction for 2010; same as 2009
+names(pred2010) <- 2010 # naming the prediction
+pred2011 <- (a * AvgPrice[2] + b * AvgPrice[1]) / (a + b) # Model's prediction for 2011
+names(pred2011) <- 2011 # naming the prediction
+preds <- c(pred2009, pred2010, pred2011, sapply(2012:2016, wma)) # combining with predictions for 2012-2016
+
+# Next, a function to help with calculating the MSE
+diffSqr <- function(i) {
+    # This function calculates the difference between actual and forecasted value,
+    # then squares the result
+    # Args: index of value to calculate
+    # Returns: numeric, representing the squared difference between the two values
+    return((AvgPrice[i] - preds[i])^2)
+}
+
+MSE_wma <- sum(sapply(1:length(AvgPrice), diffSqr)) / length(AvgPrice)
+MSE_wma # outputting results
+```
+
+Exponential Smoothing
+```{r}
+preds <- numeric(length = 8)
+preds[1] <- AvgPrice[1] # seed model by setting first prediction equal to actual
+for (i in 2:8) { # we need to find 7 more predictions
+    preds[i] <- preds[i-1] + a * (AvgPrice[i-1] - preds[i-1]) # exponential smoothing eqn
+}
+MSE_exp <- sum(sapply(1:length(AvgPrice), diffSqr)) / length(AvgPrice)
+MSE_exp # outputting results
+
+```
+
+Linear Regression time series
+```{r}
+plot(AvgPrice) # relationship appears linear, with positive correlation
+
+year <- seq(2009:2016) + 2008 # independent variable
+model <- lm(AvgPrice ~ year) # creating model
+summary(model)
+
+# Getting the "fitted" values
+df <- data.frame(year) # First, wrapping independent variable in a data frame
+preds <- predict(model, df) # calculating predictions
+
+# Calculating the MSE
+MSE_linreg <- sum(sapply(1:length(AvgPrice), diffSqr)) / length(AvgPrice)
+MSE_linreg # outputting results
+```
+
+Comparing the models based on MSE
+```{r}
+plot(c(MSE_exp, MSE_wma, MSE_linreg)) # plotting the results
+```
+Linear regression had the lowest MSE, followed by exponential smoothing and weighted moving average.
+
+
+
+10. What is the ideal set of weights for the moving average model?
+```{r}
+# The model has the below equation:
+# Yt = a*Y(t-1) + b*Y(t-2) + c*Y(t-3)
+# a = 5 # weight for most recent year
+# b = 3 # weight for second most recent year
+# c = 2 # weight for third most recent year
+dim <- 20
+
+MSE_tracker <- array(dim = c(dim, dim, dim)) # creating an array to hold all MSE values
+for (a in 1:dim) {
+    for (b in 1:dim) {
+        for (c in 1:dim) {
+        pred2009 <- AvgPrice[1] # We'll artificially set the first "prediction" to match the actual
+        pred2010 <- AvgPrice[1] # Model's prediction for 2010; same as 2009
+        pred2011 <- (a * AvgPrice[2] + b * AvgPrice[1]) / (a + b) # Model's prediction for 2011
+        preds <- c(pred2009, pred2010, pred2011,
+                   sapply(2012:2016, wma)) # combining with predictions for 2012-2016
+        MSE_tracker[a, b, c] <- sum(sapply(1:length(AvgPrice), diffSqr)) / length(AvgPrice) # calculateMSE
+        }
+    }
+}
+which.min(MSE_tracker) # determining index of the minimum MSE
+MSE_tracker[which.min(MSE_tracker)] #outputting the minimum MSE
+```
+Testing for all combinations of a, b, and c between 1 and 20 yielded that the best possible weighting was a = 20, b = 1, c = 1. We did not test for a,b,c = 0, but it makes sense that the best possible weighting would in fact be a = 1, b = 0, c = 0. We expect this result because the trend of SalePrice is consistently increasing. Therefore, a model which places maximum weight on the recent (and therefore greatest) value is closest to the next value. In practice, this means we should only look at the most recent value, ignoring all older values. Over a longer time period, where we don't see a relatively constant upward trend in average sales price, a different weighting might make more sense.
+
+
+
+
+
+
